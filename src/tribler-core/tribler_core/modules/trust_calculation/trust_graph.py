@@ -1,7 +1,6 @@
 import hashlib
+import logging
 import math
-
-from ipv8.taskmanager import TaskManager
 
 import networkx as nx
 
@@ -14,11 +13,11 @@ MAX_TRANSACTIONS = 2500
 ROOT_NODE_ID = 0
 
 
-class TrustGraph(nx.DiGraph, TaskManager):
+class TrustGraph(nx.DiGraph):
 
     def __init__(self, root_key, bandwidth_db, max_nodes=MAX_NODES, max_transactions=MAX_TRANSACTIONS):
         nx.DiGraph.__init__(self)
-        TaskManager.__init__(self)
+        self._logger = logging.getLogger(self.__class__.__name__)
 
         self.root_key = root_key
         self.bandwidth_db = bandwidth_db
@@ -38,9 +37,11 @@ class TrustGraph(nx.DiGraph, TaskManager):
 
         self.get_or_create_node(root_key)
 
-    def set_limits(self, max_peers, max_transactions):
-        self.max_nodes = max_peers
-        self.max_transactions = max_transactions
+    def set_limits(self, max_nodes=None, max_transactions=None):
+        if max_nodes:
+            self.max_nodes = max_nodes
+        if max_transactions:
+            self.max_transactions = max_transactions
 
     def get_or_create_node(self, peer_key, add_if_not_exist=True):
         if peer_key in self.node_public_keys:
@@ -51,7 +52,7 @@ class TrustGraph(nx.DiGraph, TaskManager):
             return None
 
         if self.number_of_nodes() >= self.max_nodes:
-            raise TrustGraphException("Max node peers reached in graph")
+            raise TrustGraphException(f"Max node peers ({self.max_nodes}) reached in the graph")
 
         # Node does not exist in the graph so a new node at this point.
         # The numeric node id is used here so the id for the new node becomes
@@ -70,14 +71,18 @@ class TrustGraph(nx.DiGraph, TaskManager):
 
     def compose_graph_data(self):
         layer_1 = self.bandwidth_db.get_latest_transactions(self.root_key)
-        for tx in layer_1:
-            self.add_bandwidth_transaction(tx)
+        try:
+            for tx in layer_1:
+                self.add_bandwidth_transaction(tx)
 
-            # Stop at layer 2
-            counter_party = tx.public_key_a if self.root_key != tx.public_key_a else tx.public_key_b
-            layer_2 = self.bandwidth_db.get_latest_transactions(counter_party)
-            for tx2 in layer_2:
-                self.add_bandwidth_transaction(tx2)
+                # Stop at layer 2
+                counter_party = tx.public_key_a if self.root_key != tx.public_key_a else tx.public_key_b
+                layer_2 = self.bandwidth_db.get_latest_transactions(counter_party)
+                for tx2 in layer_2:
+                    self.add_bandwidth_transaction(tx2)
+
+        except TrustGraphException as tge:
+            self._logger.warning("Error composing Trust graph: %s", tge)
 
     def compute_edge_id(self, transaction):
         sha2 = hashlib.sha3_224()  # any safe hashing should do
@@ -89,14 +94,16 @@ class TrustGraph(nx.DiGraph, TaskManager):
         # First, compose a unique edge id for the transaction and check if it is already added.
         edge_id = self.compute_edge_id(tx)
 
+        if len(self.edge_set) >= self.max_transactions:
+            raise TrustGraphException(f"Max transactions ({self.max_transactions}) reached in the graph")
+
         if edge_id not in self.edge_set:
             peer1 = self.get_or_create_node(tx.public_key_a, add_if_not_exist=True)
             peer2 = self.get_or_create_node(tx.public_key_b, add_if_not_exist=True)
 
-            if peer2['id'] not in self.successors(peer1['id']):
+            if peer1 and peer2 and peer2['id'] not in self.successors(peer1['id']):
                 self.add_edge(peer1['id'], peer2['id'])
-
-            self.edge_set.add(edge_id)
+                self.edge_set.add(edge_id)
 
     def compute_node_graph(self):
         undirected_graph = self.to_undirected()
